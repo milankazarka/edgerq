@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<service_consumer>
+    
+    <!-- setup defaults -->
+    <max_connections>50</max_connections> <!-- default max connections -->
+    <request_buffer>4096</request_buffer> <!-- default request buffer size -->
+    <request_ttl>3</request_ttl> <!-- default max TTL for a request -->
+
+    <listener>
+        <port>12345</port>
+    </listener>
+    
+    <services>
+        <service>
+            <uuid>11111111-2222-3333-4444-555555555555</uuid>
+            <name>name_of_service1</name>
+            <port>3000</port>
+
+            <max_connections>50</max_connections>
+            <request_buffer>4096</request_buffer>
+            <request_ttl>3</request_ttl>
+        
+        </service>
+        <!--
+        <service>
+            <uuid>11111111-2222-3333-4444-55555555555b</uuid>
+            <name>name_of_service2</name>
+            <port>8802</port>
+        </service>
+        <service>
+            <uuid>11111111-2222-3333-4444-55555555555c</uuid>
+            <name>name_of_service3</name>
+            <port>8803</port>
+        </service>
+        -->
+    </services>
+</service_consumer>
