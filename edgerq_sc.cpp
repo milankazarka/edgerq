@@ -33,16 +33,16 @@
 #include "msggram.hpp"
 #include <uuid/uuid.h>
 #include <string.h>
-#include "edgerq_base64.hpp"
+#include "base64.hpp"
 #include <uuid/uuid.h>
 #include <signal.h>
 #include "hex.hpp"
 #include "list.hpp"
 #include "time.hpp"
 #include "common.hpp"
+#include <arpa/inet.h>
 
-#define SC_MAX_CONNECTIONS 50
-#define SC_REQUEST_BUFFER 4096
+#define SC_MAX_REQUESTS 100 // maximum number of requests each service can hold at any time
 #define SC_TERMINATE_CHILD_PROCESSES
 
 #define SEMAPHORE_PROTECTION
@@ -67,11 +67,10 @@ RQMSG rqmsgs[NREQUESTS];
 volatile sig_atomic_t msgid = 1; // itterated in parent before spawning, only used to identify outgoing message by child process
 volatile sig_atomic_t pipemsgid = 1;
 
-//pthread_mutex_t child_mutex; // specifically for dealing with having the right values in binary semaphores on child termination 
-
 typedef struct Service {
     const char *id;
     int port;
+    bool inaddrAny;
 
     int maxConnections;
     int requestBuffer;
@@ -82,11 +81,12 @@ typedef struct Service {
 
 typedef struct Setup {
     int listenerPort;
+    bool inaddrAny;
     int maxConnections;
-    //int m_connection_thread_count;
     int requestBuffer;
     int requestTtl;
     LinkedList services;
+    // #todo - this would be a good place for pipes
 } Setup;
 
 // #todo - we need to create a structure passed down to the child_process that would have both
@@ -95,11 +95,9 @@ typedef struct Setup {
 typedef struct Request {
     long long id; // we just copy our node's id
     volatile sig_atomic_t socket;
-    //int socket;
     int pId;
     volatile sig_atomic_t pipe_fd[2]; // Pipe for parent<->child process communication
     volatile sig_atomic_t pipe_fd_rev[2];
-    //int pipe_fd[2];
     pthread_t threadId;
 } Request;
 
@@ -118,7 +116,6 @@ typedef struct Pipe {
 } Pipe;
 
 Setup globalSetup;
-LinkedList list;
 LinkedList pipes;
 
 void processRequestList(LinkedList* list, bool lock);
@@ -131,7 +128,8 @@ void initializePipe(Pipe *pipe);
 void initializeService(ServiceDef *service);
 Pipe *pipeById(const char *id);
 char* GenerateUUID();
-ServiceDef *serviceByIdInPipe(Pipe *pipe,const char *id); // #todo - evaluate if to only run on the one Pipe or check pipes - if there can be multiples
+ServiceDef *serviceDefByIdInPipe(Pipe *pipe,const char *id); // #todo - evaluate if to only run on the one Pipe or check pipes - if there can be multiples
+Service *serviceByServiceDef(LinkedList* services, ServiceDef *serviceDef, bool lock);
 void debugRequests(LinkedList* list, bool lock);
 bool loadConfigurationFile(const char *filename);
 bool runSetup(Setup *setup);
@@ -201,7 +199,7 @@ Pipe *pipeById(const char *id) {
     return NULL;
 }
 
-ServiceDef *serviceByIdInPipe(Pipe *pipe,const char *id) {
+ServiceDef *serviceDefByIdInPipe(Pipe *pipe,const char *id) {
     lockList(&pipe->serviceDefs);
     Node* current = pipe->serviceDefs.head;
     while (current != NULL) {
@@ -213,6 +211,27 @@ ServiceDef *serviceByIdInPipe(Pipe *pipe,const char *id) {
         current = current->next;
     }
     unlockList(&pipe->serviceDefs);
+    return NULL;
+}
+
+Service *serviceByServiceDef(LinkedList* services, ServiceDef *serviceDef, bool lock) {
+    if (lock)
+        lockList(services);
+    
+    Node* current = services->head;
+    while (current != NULL) {
+        Service *service = (Service*)current->data;
+        if (strcmp(service->id,serviceDef->id)==0) {
+            if (lock)
+                unlockList(services);
+            return service;
+        }
+        current = current->next;
+    }
+
+    if (lock)
+        unlockList(services);
+    
     return NULL;
 }
 
@@ -522,7 +541,7 @@ void* child_ConnectionThread(void *arg) {
 
     char buffer[service->requestBuffer];
 
-    valread = read(request->socket, buffer, SC_REQUEST_BUFFER-1);
+    valread = read(request->socket, buffer, service->requestBuffer-1);
     buffer[valread] = 0x00;
     verbose("read(%d) data(%s) from socket(%d)\n",valread,buffer,request->socket);
 
@@ -573,7 +592,16 @@ void* child_ConnectionThread(void *arg) {
 // - not sure that this is safe if we don't take action / sync it up with creation of child processes
 void *watchdog(void *data) {
     while(getpid()==parentPid) {
-        processRequestList(&list,true);
+        lockList(&globalSetup.services);
+
+        Node* current = globalSetup.services.head;
+        while (current != NULL) {
+            Service *service = (Service*)current->data;
+            processRequestList(&service->requests,true);
+            current = current->next;
+        }
+
+        unlockList(&globalSetup.services);
         usleep(50000);
     }
     return NULL;
@@ -719,7 +747,10 @@ void *serviceListener(void *arg) {
     setsockopt(server_fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
 
     address.sin_family = AF_INET;
-    address.sin_addr.s_addr = inet_addr("127.0.0.1"); // INADDR_ANY
+    if (service->inaddrAny)
+        address.sin_addr.s_addr = INADDR_ANY;
+    else
+        address.sin_addr.s_addr = inet_addr("127.0.0.1"); // INADDR_ANY
     address.sin_port = htons(service->port);
 
     // Bind socket to address and port
@@ -742,12 +773,12 @@ void *serviceListener(void *arg) {
             printf("accept\n");
 
              // helps load balancing - but would be better done in a different way
-            while (nodesCount(&list,true)>SC_MAX_CONNECTIONS) {
+            while (nodesCount(&service->requests,true)>SC_MAX_REQUESTS) {
                     printf("    too many running nodes, waiting\n");
-                    processRequestList(&list,true);
+                    processRequestList(&service->requests,true);
                     usleep(1000); 
             }
-            usleep(50*nodesCount(&list,true)); // #todo - dynamic throttling
+            usleep(50*nodesCount(&service->requests,true)); // #todo - dynamic throttling
             //usleep(1000);
 
             // this is used by the child process to identify the outgoing response when it is sent segmented
@@ -770,7 +801,7 @@ void *serviceListener(void *arg) {
             processNodes = true;
             while( pipe(pipe_fd) == -1 ) {
                 printf("    Warning: maximum amount of pipes reached\n");
-                processRequestList(&list,true);
+                processRequestList(&service->requests,true);
                 processNodes = false;
                 usleep(20000);
             }
@@ -783,12 +814,12 @@ void *serviceListener(void *arg) {
             setsockopt(pipe_fd[1], SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
 
             if (processNodes)
-                processRequestList(&list,true);
+                processRequestList(&service->requests,true);
 
             processNodes = true;
             while( pipe(pipe_fd_rev) == -1 ) {
                 printf("    Warning: maximum amount of pipes reached (b)\n");
-                processRequestList(&list,true);
+                processRequestList(&service->requests,true);
                 processNodes = false;
                 usleep(20000);
             }
@@ -797,7 +828,7 @@ void *serviceListener(void *arg) {
             setsockopt(pipe_fd_rev[1], SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
 
             if (processNodes)
-                processRequestList(&list,true);
+                processRequestList(&service->requests,true);
 
             Node* node;
             node = getNode();
@@ -821,11 +852,11 @@ void *serviceListener(void *arg) {
             //
             // #todo - this is only here (and not just in the parent), because 
             // we're copying the node's id into the request id
-            lockList(&list);
-            addNode(&list,node,false);
-            int nc = nodesCount(&list,false);
+            lockList(&service->requests);
+            addNode(&service->requests,node,false);
+            int nc = nodesCount(&service->requests,false);
             printf("nodes count(%d)\n",nc);
-            debugRequests(&list,false);
+            debugRequests(&service->requests,false);
             //unlockList(&list); // only unlock at the end in parent
             
             //usleep(nc*100); // #todo this might be contraproductive - a large part of the work on this is that more requests don't add to call-time linearly
@@ -849,14 +880,14 @@ void *serviceListener(void *arg) {
                 close(new_socket);
                 close(pipe_fd[0]);
                 close(pipe_fd[1]);
-                removeNode(&list,node,false);
-                unlockList(&list);
+                removeNode(&service->requests,node,false);
+                unlockList(&service->requests);
 
             } else if (pid == 0) {
 
                 printf("###CHILD PROCESS fd[%d]\n",pipe_fd[0]);
 
-                unlockList(&list);
+                unlockList(&service->requests);
 
                 // Child process
                 //close(sockfd);
@@ -926,7 +957,7 @@ void *serviceListener(void *arg) {
                 // the response should also be handled by the child - us forwarding it the response through a pipe
                 // - for demo/testing we can also not do that & just respond here
                 close(new_socket); // Close the socket in the parent process
-                unlockList(&list); // assumed locked
+                unlockList(&service->requests); // assumed locked
 
                 //close(pipe_fd_rev[1]); // reverse, since with this we will be reading
 
@@ -1044,14 +1075,14 @@ char* parseUDPXmlMessage(const char* xmlMessage) {
                             //printf("parsing service uuid(%s) name(%s) type(%s)\n",service_uuid,service_name,service_type);
                         } */
                     
-                        ServiceDef *service = serviceByIdInPipe(assignedPipe,service_uuid);
-                        if (!service) {
+                        ServiceDef *serviceDef = serviceDefByIdInPipe(assignedPipe,service_uuid);
+                        if (!serviceDef) {
 
-                            ServiceDef *service = (ServiceDef*)malloc(sizeof(ServiceDef));
-                            service->id = (char*)malloc(strlen(service_uuid)+1);
-                            strcpy(service->id,service_uuid);
+                            serviceDef = (ServiceDef*)malloc(sizeof(ServiceDef));
+                            serviceDef->id = (char*)malloc(strlen(service_uuid)+1);
+                            strcpy(serviceDef->id,service_uuid);
                             Node *snode = getNode();
-                            snode->data = service;
+                            snode->data = serviceDef;
                             addNode(&assignedPipe->serviceDefs,snode,true);
 
                             strcat(result,"  <service uuid=\"");
@@ -1061,7 +1092,7 @@ char* parseUDPXmlMessage(const char* xmlMessage) {
                             // #todo - do we acknowledge that we received response? (circular logic?)
 
                             strcat(result,"  <service uuid=\"");
-                            strcat(result,service->id);
+                            strcat(result,serviceDef->id);
                             strcat(result,"\">");
 
                             // #todo - #refactoring
@@ -1086,9 +1117,13 @@ char* parseUDPXmlMessage(const char* xmlMessage) {
                                         httpResponse = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 25\r\nContent-Type: text/plain\r\n\r\nBad Gateway: Routing Error.";
                                     }
 
-                                    lockList(&list); // lock here so we don't work with a node that get's handled elsewhere
+                                    lockList(&globalSetup.services);
+
+                                    Service *service = serviceByServiceDef(&globalSetup.services,serviceDef,false);
+                                    lockList(&service->requests);
+
                                     // atol
-                                    Node *node = getNodeById(&list,atol(responseElement->Attribute("request_id")),false);
+                                    Node *node = getNodeById(&service->requests,atol(responseElement->Attribute("request_id")),false);
                                     if (node) {
                                         Request *request = (Request*)node->data;
                                         
@@ -1110,7 +1145,10 @@ char* parseUDPXmlMessage(const char* xmlMessage) {
                                     } else {
                                         verbose("Warning: got response for Request node that is no longer registered\n");
                                     }
-                                    unlockList(&list);
+                                    
+                                    unlockList(&service->requests);
+
+                                    unlockList(&globalSetup.services);
 
                                     if (payloadDataDecoded)
                                         free(payloadDataDecoded);
@@ -1153,7 +1191,10 @@ void *udpserver_thread(void *arg) {
     // Set up the server address
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = inet_addr("127.0.0.1"); // INADDR_ANY;
+    if (setup->inaddrAny)
+        server_addr.sin_addr.s_addr = INADDR_ANY;
+    else
+        server_addr.sin_addr.s_addr = inet_addr("127.0.0.1"); // INADDR_ANY;
     server_addr.sin_port = htons(setup->listenerPort);
     
     // Bind the socket to the server address
@@ -1334,6 +1375,15 @@ bool loadConfigurationFile(const char *filename, Setup *setup) {
 
         setup->listenerPort = port_elem->IntText();
 
+        // optional
+        setup->inaddrAny = false;
+        tinyxml2::XMLElement* inaddr_elem = listener_elem->FirstChildElement("inaddr_any");
+        if (inaddr_elem) {
+            if (strcmp(inaddr_elem->GetText(),"yes")==0) {
+                setup->inaddrAny = true;
+            }
+        }
+
         tinyxml2::XMLElement* services_elem = sc_elem->FirstChildElement("services");
         if (!services_elem) {
             printf("Error: could not find services element\n");
@@ -1406,6 +1456,14 @@ bool loadConfigurationFile(const char *filename, Setup *setup) {
             service->maxConnections = service_max_connections;
             service->requestBuffer = service_request_buffer;
             service->requestTtl = service_request_ttl;
+            // todo
+            service->inaddrAny = false;
+            tinyxml2::XMLElement* service_inaddr_elem = service_elem->FirstChildElement("inaddr_any");
+            if (service_inaddr_elem) {
+                if (strcmp(service_inaddr_elem->GetText(),"yes")==0) {
+                    service->inaddrAny = true;
+                }
+            }
 
             Node *node = (Node*)malloc(sizeof(Node));
             node->data = service;
@@ -1425,6 +1483,8 @@ bool initService(Service *service, const char *uuid, const char *name, int port)
     service->id = (const char*)malloc(37);
     strcpy((char*)service->id,uuid);
     service->port = port; // todo - add checks prior
+
+    initLinkedList(&service->requests,true);
 
     return true;
 }
@@ -1498,7 +1558,7 @@ int main(int argc, char *argv[]) {
 
     parentPid = getpid();
 
-    initLinkedList(&list,LIST_USEMUTEX);
+    //initLinkedList(&list,LIST_USEMUTEX);
     initLinkedList(&pipes,LIST_USEMUTEX);
 
     // Create and open the named semaphore
