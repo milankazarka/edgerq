@@ -31,7 +31,6 @@
 #include <semaphore.h>
 #include <tinyxml2.h>
 #include "msggram.hpp"
-#include <uuid/uuid.h>
 #include <string.h>
 #include "base64.hpp"
 #include <uuid/uuid.h>
@@ -55,9 +54,8 @@ sem_t *binarySemaphore; // Pointer to the semaphore
 // simulation
 #define MAX_UDP_MSG_SIZE 1024*64 // buffer for UDP read #todo - rename
 #define NREQUESTS 20 // maximum requests we are constructing out of segments at any given time
-int sockfd;
-struct sockaddr_in server_addr, client_addr;
-socklen_t addr_len;
+int sockfd; // listener socket
+struct sockaddr_in server_addr; // there is only a single UDP listeniner
 RQMSG rqmsgs[NREQUESTS];
 // \simulation
 
@@ -76,6 +74,8 @@ typedef struct Service {
     int requestBuffer;
     int requestTtl;
 
+    char *pipeId; // #todo - change to a list of pipes when we'll add load balancing one service to multiple pipes
+
     LinkedList requests;
 } Service;
 
@@ -93,11 +93,11 @@ typedef struct Setup {
 // the Service and Request - to be able to do things like lock the binary semaphore
 //
 typedef struct Request {
-    long long id; // we just copy our node's id
+    long long id;
     volatile sig_atomic_t socket;
     int pId;
     volatile sig_atomic_t pipe_fd[2]; // Pipe for parent<->child process communication
-    volatile sig_atomic_t pipe_fd_rev[2];
+    volatile sig_atomic_t pipe_fd_rev[2]; // rename to Unix Pipes as we also have Service Pipes
     pthread_t threadId;
 } Request;
 
@@ -112,6 +112,7 @@ typedef struct ServiceDef { // #todo #refactoring
 
 typedef struct Pipe {
     const char *id; // Id or id?
+    struct sockaddr_in client_addr;
     LinkedList serviceDefs;
 } Pipe;
 
@@ -182,9 +183,14 @@ void initializeService(ServiceDef *service,const char *id) {
     strcpy(service->id,id); // #todo - check if the const is needed in service
 }
 
-Pipe *pipeById(const char *id) {
-    verbose("pipeById\n");
-    lockList(&pipes);
+Pipe *pipeById(const char *id,bool lock) {
+    verbose("pipeById %s\n",id);
+    if (!id) {
+        verbose("warning: Id NULL\n");
+        return NULL;
+    }
+    if (lock)
+        lockList(&pipes);
     Node* current = pipes.head;
     while (current != NULL) {
         Pipe *pipe = (Pipe*)current->data;
@@ -195,7 +201,8 @@ Pipe *pipeById(const char *id) {
         }
         current = current->next;
     }
-    unlockList(&pipes);
+    if (lock)
+        unlockList(&pipes);
     return NULL;
 }
 
@@ -422,6 +429,8 @@ void removeRequestsWithDuplicateSocket(LinkedList* list,int socket,bool lock) {
 /**
 * #todo - change from using a binary semaphore for locking to posix mutex as we should
 * not be calling this function from child processes anyway
+*
+* #todo - set the addrlen here instead of passing it possibly
 */
 void udpsend(const char *message, const struct sockaddr_in *addr, int addrlen) {
     verbose("udpsend message(%s)\n",message);
@@ -610,7 +619,9 @@ void *watchdog(void *data) {
 typedef struct PipeListener {
     int pipeFd;
     // #todo - another verification mechanism & info to check if we're processing data for the right request
-} PipeListenerData;
+    Service *service; // #todo - or ServiceDef
+    //struct sockaddr_in client_addr;
+} PipeListener;
 
 /** we just forward data that comes through this pipe through UDP
 */
@@ -693,7 +704,27 @@ void *pipeListener(void *data) { // #todo - make sure it is understood that this
 
             printf("sending response through pipeListener\n");
             //printHex(completemsg,index);
-            udpsend(completemsg,&client_addr,addr_len);
+
+            // #todo - add lock once we add propper cleanup
+            
+            lockList(&pipes);
+            if (listener->service->pipeId) {
+                Pipe *assignedPipe = pipeById(listener->service->pipeId,false); // #todo - wouldn't survive pipe clean-up in parallel
+                if (assignedPipe) {
+                    printf("have assigned pipe\n");
+                    udpsend(completemsg,&assignedPipe->client_addr,sizeof(assignedPipe->client_addr));
+                } else {
+                    printf("warning: can't send udp message 01 - pipe not in list\n");
+                    exit(2);
+                }
+            } else {
+                printf("warning: can't send udp message 02 - pipe not assigned\n");
+                exit(2);
+            }
+            unlockList(&pipes);
+
+            //udpsend(completemsg,&listener->client_addr,sizeof(listener->client_addr));
+            
             printf("data forwarded through UDP\n");
 
             printf("3\n");
@@ -770,6 +801,13 @@ void *serviceListener(void *arg) {
             perror("accept");
         } else {
             
+            //Pipe *assignedPipe = pipeById(service->pipeId); // #todo - the naming here is confusing since we use Unix pipes & 
+            // & we also call the route to the client a Pipe
+            //if (!assignedPipe) {
+            //    printf("WARNING: ServicePipe is not yet assigned to service\n");
+            //    continue;
+            //}
+
             printf("accept\n");
 
              // helps load balancing - but would be better done in a different way
@@ -943,6 +981,7 @@ void *serviceListener(void *arg) {
 
                 PipeListener *listener = (PipeListener*)malloc(sizeof(PipeListener));
                 listener->pipeFd = pipe_fd_rev[0];
+                listener->service = service; // #todo
                 pthread_t pipeThread;
                 pthread_create(&pipeThread, NULL, pipeListener, listener);
                 pthread_detach(pipeThread);
@@ -974,17 +1013,32 @@ void *serviceListener(void *arg) {
     return NULL;
 }
 
+typedef struct ParseResult {
+    char *message; // to release (#todo - make prettier)
+    //Pipe *assignedPipe;
+    char *assignedPipeId; // to release
+} ParseResult;
+
 /**
 * #todo - too long, too complicated, too many levels
+*
+* #todo - decide if we lock pipes for this method since it returns either one or id in the implementation
 */
-char* parseUDPXmlMessage(const char* xmlMessage) {
+ParseResult *parseUDPXmlMessage(const char* xmlMessage) {
         
         verbose("ParseXmlMessage\n");
         
+        ParseResult *parseResult = (ParseResult*)malloc(sizeof(ParseResult));
+        parseResult->message = NULL;
+        //parseResult->assignedPipe = NULL;
+        parseResult->assignedPipeId = NULL;
+
         Pipe *assignedPipe = NULL;
         
         char *result = (char*)malloc(4096); // #todo
         result[0] = 0x00;
+
+        parseResult->message = result;
 
         // Parse the XML document
         tinyxml2::XMLDocument xmlDoc;
@@ -996,7 +1050,8 @@ char* parseUDPXmlMessage(const char* xmlMessage) {
 
             // #todo
             //result.response = CreateErrorResponse(xmlDoc.ErrorStr());
-            return result;
+            
+            return parseResult;
         }
 
         strcat(result,"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
@@ -1013,10 +1068,13 @@ char* parseUDPXmlMessage(const char* xmlMessage) {
 
             verbose("have pipeId\n");
             
-            assignedPipe = pipeById(pipeId);
+            assignedPipe = pipeById(pipeId,true);
             if (!assignedPipe) {
                 verbose("didn't find pipe\n");
             }
+            
+            parseResult->assignedPipeId = (char*)malloc(strlen(pipeId)+1);
+            strcpy(parseResult->assignedPipeId,pipeId);
 
             // #todo - error response on pipeId not found
             /**
@@ -1031,18 +1089,16 @@ char* parseUDPXmlMessage(const char* xmlMessage) {
         } else {
             // Create a new pipe route if necessary
             if (xmlDoc.FirstChildElement("message")->FirstChildElement("request_pipe_id")) {
-                /**
-                CMyPipeRoute* pipeRoute = new CMyPipeRoute();
-                pipeRoute->consumer = this; // #todo - make consumer private, add handling methods
-                pipeRoute->CreateUUID();
-
-                m_pipeRoutes.push_back(pipeRoute);
-                */
                 
                 verbose("create new pipe\n");
 
                 assignedPipe = (Pipe*)malloc(sizeof(Pipe));
                 initializePipe(assignedPipe);
+
+                parseResult->assignedPipeId = (char*)malloc(strlen(assignedPipe->id)+1);
+                strcpy(parseResult->assignedPipeId,assignedPipe->id);
+                printf("have new pipeid(%s)\n",parseResult->assignedPipeId);
+
                 Node *node = getNode(); // #todo - rename to initializeNode()
                 node->data = assignedPipe;
                 addNode(&pipes,node,true);
@@ -1074,7 +1130,8 @@ char* parseUDPXmlMessage(const char* xmlMessage) {
                         } else {
                             //printf("parsing service uuid(%s) name(%s) type(%s)\n",service_uuid,service_name,service_type);
                         } */
-                    
+    
+
                         ServiceDef *serviceDef = serviceDefByIdInPipe(assignedPipe,service_uuid);
                         if (!serviceDef) {
 
@@ -1084,6 +1141,15 @@ char* parseUDPXmlMessage(const char* xmlMessage) {
                             Node *snode = getNode();
                             snode->data = serviceDef;
                             addNode(&assignedPipe->serviceDefs,snode,true);
+
+                            // we assign a pipe to a service. This doesn't survive any cleanup for now.
+                            // In the next versions add a list of assigned pipes, so that we can 
+                            // implement load balancing.
+                            //
+                            Service *service = serviceByServiceDef(&globalSetup.services,serviceDef,false);
+                            service->pipeId = (char*)malloc(strlen(pipeId)+1); // #todo - must always be uuid, add checks & just alloc that size
+                            strcpy(service->pipeId,pipeId); // #todo - there should be pipeDefs in service (plan to add load balancing)
+                            printf("SERVICE ASSIGNED pipeId(%s)\n",service->pipeId);
 
                             strcat(result,"  <service uuid=\"");
                             strcat(result,service_uuid);
@@ -1119,11 +1185,16 @@ char* parseUDPXmlMessage(const char* xmlMessage) {
 
                                     lockList(&globalSetup.services);
 
+                                    
                                     Service *service = serviceByServiceDef(&globalSetup.services,serviceDef,false);
+                                    /**service->pipeId = (char*)malloc(strlen(pipeId)+1); // #todo - must always be uuid, add checks & just alloc that size
+                                    strcpy(service->pipeId,pipeId); // #todo - there should be pipeDefs in service (plan to add load balancing)
+                                    */
+
                                     lockList(&service->requests);
 
                                     // atol
-                                    Node *node = getNodeById(&service->requests,atol(responseElement->Attribute("request_id")),false);
+                                    Node *node = getNodeById(&service->requests,atoll(responseElement->Attribute("request_id")),false);
                                     if (node) {
                                         Request *request = (Request*)node->data;
                                         
@@ -1170,7 +1241,8 @@ char* parseUDPXmlMessage(const char* xmlMessage) {
         strcat(result,"</response>\n");
         strcat(result,"</message>\n");
 
-        return result;
+        //parseResult->assignedPipe = assignedPipe;
+        return parseResult;
     }
 
 void *udpserver_thread(void *arg) {
@@ -1226,7 +1298,11 @@ void *udpserver_thread(void *arg) {
     }
     
     char *completemsg = NULL;
-    addr_len = sizeof(client_addr); // #todo
+    //addr_len = sizeof(client_addr); // #todo
+    
+    struct sockaddr_in client_addr;
+    socklen_t addr_len = sizeof(client_addr); // #todo
+
     while (1) {
         // Receive a message from a client
         //addr_len = sizeof(client_addr);
@@ -1308,18 +1384,45 @@ void *udpserver_thread(void *arg) {
 
         printf("Received message from client: (%s)\n", completemsg);
 
-        char *result = parseUDPXmlMessage(completemsg);
-        printf("response using(%s)\n",result);
-
-        printf("run udpsend from parent thread\n");
-        if (result) {
-            udpsend(result,&client_addr,addr_len);
+        //char *result = parseUDPXmlMessage(completemsg); // #todo - add returning of a struct with the needed data
+        
+        ParseResult *parseResult = parseUDPXmlMessage(completemsg);
+        
+        lockList(&pipes);
+        if (parseResult->assignedPipeId) {
+            Pipe *pipe = pipeById(parseResult->assignedPipeId,false);
+            if (pipe) {
+                pipe->client_addr = client_addr;
+            } else {
+                printf("could not deduct pipe id\n");
+            }
+            free(parseResult->assignedPipeId);
+        } else {
+            printf("missing pipe id\n");
+            exit(2);
         }
-        printf("run udpsend from parent thread after\n");
+        unlockList(&pipes);
+        /**
+        if (parseResult->assignedPipe) {
+            parseResult->assignedPipe->client_addr = client_addr; // #todo
+        } else {
+            printf("### pipe NOT assigned\n");
+        } */
+
+        if (parseResult->message) {
+            printf("response using(%s)\n",parseResult->message);
+
+            printf("run udpsend from parent thread\n");
+            
+            udpsend(parseResult->message,&client_addr,addr_len); // #todo
+            
+            printf("run udpsend from parent thread after\n");
+            free(parseResult->message);
+        }
+        free(parseResult);
 
         free(completemsg);
         invalidateRQMSG(rqmsg);
-        free(result);
         
     }
 
@@ -1456,6 +1559,7 @@ bool loadConfigurationFile(const char *filename, Setup *setup) {
             service->maxConnections = service_max_connections;
             service->requestBuffer = service_request_buffer;
             service->requestTtl = service_request_ttl;
+            service->pipeId = NULL; // #todo
             // todo
             service->inaddrAny = false;
             tinyxml2::XMLElement* service_inaddr_elem = service_elem->FirstChildElement("inaddr_any");
@@ -1544,12 +1648,11 @@ int main(int argc, char *argv[]) {
 
     if (argc < 2) {
         printf("Usage: %s <filename>\n",argv[0]);
-        //return 1;
+        return 1;
     }
 
     initLinkedList(&globalSetup.services,LIST_USEMUTEX);
-    //if (!loadConfigurationFile(argv[1],&globalSetup)) {
-    if (!loadConfigurationFile("/Users/milankazarka/Desktop/quasirq/consumer.xml",&globalSetup)) {
+    if (!loadConfigurationFile(argv[1],&globalSetup)) {
         printf("Error: failed to load configuration file\n");
         return 1;
     }
