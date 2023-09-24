@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<service_provider>
+  <pipes>
+    <pipe>
+        <name>pipe1</name>
+        <!-- hostname and port to which our pipe connects to - remote host (or tunneled using stunnel) to whom we 
+        provide the service -->
+        <!-- <hostname>127.0.0.1</hostname> -->
+        <hostname>127.0.0.1</hostname>
+        <port>9000</port>
+        <services>
+            <service>
+                <uuid>11111111-2222-3333-4444-555555555555</uuid>
+                <name>name_of_service1</name>
+                <!-- internal - our host providing the service -->
+                <hostname>127.0.0.1</hostname>
+                <port>3088</port>
+            </service>
+
+		<!--
+            <service>
+                <uuid>11111111-2222-3333-4444-55555555555b</uuid>
+                <name>name_of_service2</name>
+                
+                <hostname>127.0.0.1</hostname>
+                <port>3000</port>
+            </service>
+		-->
+
+            <!--
+            <service>
+                <uuid>66666666-7777-8888-9999-000000000000</uuid>
+                <name>name_of_service2</name>
+            </service>
+            -->
+        </services>
+    </pipe>
+    <!--
+    <pipe>
+        <name>pipe2</name>
+        <hostname>localhost</hostname>
+        <port>9001</port>
+        <services>
+            <service>
+                <uuid>aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee</uuid>
+                <name>name_of_service3</name>
+            </service>
+            <service>
+                <uuid>ffffffffff-gggg-hhhh-iiii-jjjjjjjjjjjj</uuid>
+                <name>name_of_service4</name>
+            </service>
+        </services>
+    </pipe>
+    -->
+  </pipes>
+</service_provider>
