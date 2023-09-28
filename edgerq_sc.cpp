@@ -33,7 +33,8 @@
 #include "msggram.hpp"
 #include <string.h>
 #include "base64.hpp"
-#include <uuid/uuid.h>
+//#include <uuid/uuid.h>
+#include "uuid4.h"
 #include <signal.h>
 #include "hex.hpp"
 #include "list.hpp"
@@ -141,12 +142,17 @@ void *pipeListener(void *data);
 
 // Helper function to generate a new UUID
 char* GenerateUUID() {
+    /**
     uuid_t uuid;
     uuid_generate(uuid);
 
     char *uuidStr = (char*)malloc(37);
     uuid_unparse(uuid, uuidStr);
     return uuidStr;
+    */
+    char *uuid = (char*)malloc(UUID4_LEN);
+    uuid4_generate(uuid);
+    return uuid;
 }
 
 // https://codereview.stackexchange.com/questions/29198/random-string-generator-in-c
@@ -881,12 +887,6 @@ void *serviceListener(void *arg) {
             request->pId = -1;
             node->data = request;
             
-            // we launch this before forking
-            //PipeListener *listener = (PipeListener*)malloc(sizeof(PipeListener));
-            //listener->pipeFd = pipe_fd_rev[0];
-            //pthread_t pipeThread;
-            //pthread_create(&pipeThread, NULL, pipeListener, listener);
-            
             //
             // #todo - this is only here (and not just in the parent), because 
             // we're copying the node's id into the request id
@@ -952,8 +952,6 @@ void *serviceListener(void *arg) {
                 }
 
                 char buffer[100];
-
-                //while(1) { usleep(1000); }
 
                 // we keep the process up and running until we receive a response to forward from the server
                 ssize_t bytes_read = read(pipe_fd[0], buffer, sizeof(buffer));
@@ -1249,10 +1247,7 @@ void *udpserver_thread(void *arg) {
 
     Setup *setup = (Setup*)arg;
 
-    //int sockfd;
-    //struct sockaddr_in server_addr, client_addr;
-    //socklen_t addr_len;
-    char buffer[MAX_UDP_MSG_SIZE];
+    char buffer[MAX_UDP_MSG_SIZE]; // #todo
 
     // Create a UDP socket
     if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) == -1) {
@@ -1402,12 +1397,6 @@ void *udpserver_thread(void *arg) {
             exit(2);
         }
         unlockList(&pipes);
-        /**
-        if (parseResult->assignedPipe) {
-            parseResult->assignedPipe->client_addr = client_addr; // #todo
-        } else {
-            printf("### pipe NOT assigned\n");
-        } */
 
         if (parseResult->message) {
             printf("response using(%s)\n",parseResult->message);
@@ -1650,6 +1639,8 @@ int main(int argc, char *argv[]) {
         printf("Usage: %s <filename>\n",argv[0]);
         return 1;
     }
+
+    uuid4_init();
 
     initLinkedList(&globalSetup.services,LIST_USEMUTEX);
     if (!loadConfigurationFile(argv[1],&globalSetup)) {
