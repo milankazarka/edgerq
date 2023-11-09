@@ -77,12 +77,15 @@ I made the decision to leave encryption to projects and people who specifically 
 **Howto:**
 
 1 - Generate a private key:
+
 openssl genpkey -algorithm RSA -out server-key.pem
 
 2 - Generate a certificate signing request (CSR):
+
 openssl req -new -key server-key.pem -out server-csr.pem
 
 3 - Generate a self signed certificate from the CSR:
+
 openssl x509 -req -days 365 -in server-csr.pem -signkey server-key.pem -out server-cert.pem
 
 **edgerq_sc stunnel configuration example:**
@@ -90,10 +93,13 @@ openssl x509 -req -days 365 -in server-csr.pem -signkey server-key.pem -out serv
 ; Sample stunnel configuration for server
 
 cert = server-cert.pem
+
 key = server-key.pem
 
 [my_service]
+
 accept = 3443 ; Port to listen on
+
 connect = 127.0.0.1:3080 ; Address and port of the internal service
 
 **edgerq_sp stunnel configuration example:**
@@ -103,9 +109,13 @@ connect = 127.0.0.1:3080 ; Address and port of the internal service
 client = yes
 
 [my_remote_service]
+
 accept = 127.0.0.1:2080 ; Local address and port
+
 connect = server_ip:3443 ; Address and port of the server
+
 verify = 2 ; Verify server certificate
+
 CAfile = server-cert.pem ; CA certificate file
 
 # Testing during development
